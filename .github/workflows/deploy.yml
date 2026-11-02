@@ -1,6 +1,13 @@
 name: Deploy Karas Telegram bot
 
 on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - .github/workflows/deploy.yml
+      - README.md
+      - infra/README.md
   workflow_dispatch:
     inputs:
       revision:

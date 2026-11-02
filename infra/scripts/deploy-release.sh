@@ -19,15 +19,37 @@ set +a
 
 npm ci --include=dev --no-audit --no-fund
 npm run build
+
+/usr/local/sbin/karas-telegram-bot-provision-secrets
+python3 - <<'PY'
+import json
+import urllib.error
+import urllib.request
+
+values = {}
+with open('/etc/karas-telegram-bot/secrets', encoding='utf-8') as secret_file:
+    for line in secret_file:
+        key, _, value = line.rstrip('\n').partition('=')
+        values[key] = value
+
+request = urllib.request.Request('https://api.telegram.org/bot' + values['BOT_TOKEN'] + '/getMe')
+try:
+    with urllib.request.urlopen(request, timeout=20) as response:
+        result = json.load(response)
+    if not result.get('ok'):
+        raise SystemExit('Telegram rejected the configured bot token.')
+except urllib.error.HTTPError as error:
+    raise SystemExit(f'Telegram rejected the configured bot token (HTTP {error.code}).')
+except Exception as error:
+    raise SystemExit(f'Telegram API preflight failed ({type(error).__name__}).')
+print('Telegram bot API preflight succeeded.')
+PY
+
 systemctl stop karas-telegram-bot.service || true
 npm run db:migrate
 npm prune --omit=dev --no-audit --no-fund
 chown -R karasbot:karasbot /var/lib/karas-telegram-bot
 chmod 0700 /var/lib/karas-telegram-bot
-
-if [[ ! -s /etc/karas-telegram-bot/secrets ]]; then
-  /usr/local/sbin/karas-telegram-bot-provision-secrets
-fi
 
 chown -R root:karasbot "$RELEASE_DIR"
 chmod -R g+rX,o-rwx "$RELEASE_DIR"
@@ -45,6 +67,8 @@ if ! systemctl restart karas-telegram-bot.service; then
     ln -s "$PREVIOUS_RELEASE" "$APP_ROOT/current.rollback"
     mv -Tf "$APP_ROOT/current.rollback" "$CURRENT"
     systemctl restart karas-telegram-bot.service || true
+  else
+    systemctl stop karas-telegram-bot.service || true
   fi
   echo "The bot service did not start for release $REVISION." >&2
   exit 1

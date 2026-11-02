@@ -22,7 +22,8 @@ Initial provisioning copies the values once to a root-owned file with 0600
 permissions under /etc/karas-telegram-bot. systemd reads that file when it
 starts the bot, so service restarts do not call Parameter Store or KMS. The
 AWS-managed SSM KMS key has no monthly key charge; its encrypt/decrypt API
-requests are metered. Do not commit .env.
+requests are metered; each deployment refreshes the local secret file once.
+Do not commit .env.
 
 ## Deployment
 
@@ -31,8 +32,9 @@ sends a command through Systems Manager to the EC2 instance carrying the
 KarasBotDeployTarget tag. IAM further restricts that role to the selected
 instance. The server accepts only commits that belong to main.
 
-The initial workflow is manual. After the first release is deployed and
-verified, pushes to main will be enabled for automatic deployment.
+Code pushes to main are deployed through GitHub Actions. Documentation and
+workflow-only commits do not deploy. A manual workflow run can also deploy a
+commit from main.
 
 To inspect the service through SSM:
 
