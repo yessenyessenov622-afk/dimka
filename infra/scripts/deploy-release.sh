@@ -19,8 +19,11 @@ set +a
 
 npm ci --include=dev --no-audit --no-fund
 npm run build
+systemctl stop karas-telegram-bot.service || true
 npm run db:migrate
 npm prune --omit=dev --no-audit --no-fund
+chown -R karasbot:karasbot /var/lib/karas-telegram-bot
+chmod 0700 /var/lib/karas-telegram-bot
 
 if [[ ! -s /etc/karas-telegram-bot/secrets ]]; then
   /usr/local/sbin/karas-telegram-bot-provision-secrets
@@ -36,6 +39,7 @@ fi
 ln -s "$RELEASE_DIR" "$APP_ROOT/current.next"
 mv -Tf "$APP_ROOT/current.next" "$CURRENT"
 
+RESTARTS_BEFORE="$(systemctl show karas-telegram-bot.service --property=NRestarts --value)"
 if ! systemctl restart karas-telegram-bot.service; then
   if [[ -n "$PREVIOUS_RELEASE" && -d "$PREVIOUS_RELEASE" ]]; then
     ln -s "$PREVIOUS_RELEASE" "$APP_ROOT/current.rollback"
@@ -46,13 +50,25 @@ if ! systemctl restart karas-telegram-bot.service; then
   exit 1
 fi
 
+SERVICE_READY=0
 for attempt in {1..15}; do
-  if systemctl is-active --quiet karas-telegram-bot.service; then
+  sleep 2
+  RESTARTS_NOW="$(systemctl show karas-telegram-bot.service --property=NRestarts --value)"
+  if [[ "$RESTARTS_NOW" != "$RESTARTS_BEFORE" ]]; then
     break
   fi
-  sleep 2
+  if systemctl is-active --quiet karas-telegram-bot.service; then
+    SERVICE_READY=1
+    break
+  fi
 done
-if ! systemctl is-active --quiet karas-telegram-bot.service; then
+if [[ "$SERVICE_READY" -ne 1 ]]; then
+  systemctl stop karas-telegram-bot.service || true
+  if [[ -n "$PREVIOUS_RELEASE" && -d "$PREVIOUS_RELEASE" ]]; then
+    ln -s "$PREVIOUS_RELEASE" "$APP_ROOT/current.rollback"
+    mv -Tf "$APP_ROOT/current.rollback" "$CURRENT"
+    systemctl start karas-telegram-bot.service || true
+  fi
   echo "The bot service is not active after deployment." >&2
   exit 1
 fi
