@@ -1,0 +1,35 @@
+{
+  "name": "anonymous-inbox-task-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Telegram inbox and task tracker powered by Telegraf, PostgreSQL and Prisma",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "prisma generate && tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "db:generate": "prisma generate",
+    "db:migrate": "prisma migrate deploy",
+    "db:migrate:dev": "prisma migrate dev",
+    "test": "npm run build && node tests/domain.test.cjs"
+  },
+  "engines": { "node": ">=20.19.0" },
+  "dependencies": {
+    "@prisma/client": "6.19.3",
+    "dotenv": "^16.6.1",
+    "luxon": "^3.7.2",
+    "node-cron": "^4.2.1",
+    "telegraf": "^4.16.3"
+  },
+  "devDependencies": {
+    "@types/luxon": "^3.7.1",
+    "@types/node": "^22.15.30",
+    "@types/node-cron": "^3.0.11",
+    "prisma": "6.19.3",
+    "tsx": "^4.20.3",
+    "typescript": "^5.9.2"
+  },
+  "overrides": {
+    "deepmerge-ts": "^8.0.0"
+  }
+}
