@@ -10,8 +10,8 @@ if [[ ! "$REVISION" =~ ^[0-9a-f]{40}$ ]]; then
   exit 2
 fi
 
-git --git-dir="$BARE_REPO" fetch --quiet origin main
-if ! git --git-dir="$BARE_REPO" merge-base --is-ancestor "$REVISION" refs/heads/main; then
+git --git-dir="$BARE_REPO" fetch --quiet origin +refs/heads/main:refs/remotes/origin/main
+if ! git --git-dir="$BARE_REPO" merge-base --is-ancestor "$REVISION" refs/remotes/origin/main; then
   echo "The requested commit is not on the main branch." >&2
   exit 2
 fi
