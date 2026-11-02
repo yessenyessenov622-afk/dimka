@@ -33,10 +33,10 @@ At 730 hours per month, current eu-north-1 list prices are approximately:
 - t3.small Linux EC2: USD 15.77
 - db.t4g.micro PostgreSQL Multi-AZ: USD 24.09
 - 20 GB RDS gp3 Multi-AZ storage: USD 4.80
-- 16 GB EC2 gp3 root volume: about USD 1.54
+- 16 GB EC2 gp3 root volume: about USD 1.34
 - One public IPv4 address: about USD 3.65
 - Three customer-managed KMS keys: about USD 3.00
-- Two Secrets Manager secrets: about USD 0.80
+- Three Secrets Manager secrets (including the RDS-managed master secret): about USD 1.20
 
 Estimated baseline total: about USD 54 per month before tax, internet data
 transfer, CloudWatch log ingestion, and backup storage above the included
@@ -49,7 +49,9 @@ continue to incur charges until deliberately deleted.
 The CloudFormation template is
 cloudformation/dimka-production.yaml. It requires the numeric Telegram owner ID
 as a stack parameter; the public template does not contain that ID. The runtime
-secret helper fetches credentials only when the bot or migrations start.
+secret helper fetches credentials only when the bot or migrations start. Use
+stack name dimka-prod because the staged GitHub Actions workflow targets the
+role with that name.
 
 The initial AWS rollout must create the stack, set the bot token secret, wait
 for the worker to register in Systems Manager, then run the deployment for the
