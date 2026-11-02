@@ -1,0 +1,84 @@
+name: Deploy Dimka to AWS
+
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: Full commit SHA to deploy (defaults to the workflow commit)
+        required: false
+        type: string
+
+permissions:
+  contents: none
+  id-token: write
+
+concurrency:
+  group: dimka-production-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      AWS_REGION: eu-north-1
+      DEPLOY_REVISION: ${{ inputs.revision || github.sha }}
+    steps:
+      - name: Configure AWS credentials with GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: arn:aws:iam::478726716640:role/dimka-prod-github-deploy
+          aws-region: eu-north-1
+          role-session-name: dimka-${{ github.run_id }}
+
+      - name: Deploy the selected commit through SSM
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$DEPLOY_REVISION" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "DEPLOY_REVISION must be a full 40-character commit SHA." >&2
+            exit 2
+          fi
+
+          command_id="$(aws ssm send-command \
+            --targets Key=tag:DimkaDeployTarget,Values=dimka-prod \
+            --document-name AWS-RunShellScript \
+            --comment "Deploy $DEPLOY_REVISION" \
+            --timeout-seconds 600 \
+            --max-concurrency 1 \
+            --max-errors 0 \
+            --parameters "commands=sudo /usr/local/sbin/dimka-deploy $DEPLOY_REVISION" \
+            --query 'Command.CommandId' \
+            --output text)"
+
+          instance_id=""
+          for attempt in {1..20}; do
+            instance_id="$(aws ssm list-command-invocations \
+              --command-id "$command_id" \
+              --query 'CommandInvocations[0].InstanceId' \
+              --output text 2>/dev/null || true)"
+            if [[ -n "$instance_id" && "$instance_id" != "None" ]]; then
+              break
+            fi
+            sleep 3
+          done
+          if [[ -z "$instance_id" || "$instance_id" == "None" ]]; then
+            echo "SSM did not report a target instance for command $command_id." >&2
+            exit 1
+          fi
+
+          aws ssm wait command-executed --command-id "$command_id" --instance-id "$instance_id"
+          status="$(aws ssm get-command-invocation \
+            --command-id "$command_id" \
+            --instance-id "$instance_id" \
+            --query Status \
+            --output text)"
+          if [[ "$status" != "Success" ]]; then
+            aws ssm get-command-invocation \
+              --command-id "$command_id" \
+              --instance-id "$instance_id" \
+              --query StandardErrorContent \
+              --output text
+            echo "Deployment finished with SSM status: $status" >&2
+            exit 1
+          fi

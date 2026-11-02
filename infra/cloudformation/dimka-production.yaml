@@ -1,0 +1,724 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Hosts the Dimka Telegram worker and PostgreSQL database in a dedicated VPC;
+  private database access and GitHub OIDC deployments avoid inbound server ports
+  and long-lived AWS keys.
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+  com.aws.cloudformation.Context:
+    arch: GitHub Actions OIDC -> SSM Run Command -> one EC2 worker; private Multi-AZ RDS PostgreSQL; no inbound EC2 ports.
+    must:
+      - Only yessenyessenov622-afk/dimka main may assume the deployment role.
+      - Keep PostgreSQL private and accept port 5432 only from the worker security group.
+      - Keep Telegram and database credentials in Secrets Manager, never in Git or UserData.
+      - Retain database, bot-token secret, and KMS keys if the stack is deleted or replaced.
+      - Run exactly one long-polling bot process for this Telegram token.
+Parameters:
+  OwnerTelegramId:
+    Type: String
+    Description: Numeric Telegram ID of the bot owner. Supplied only when creating the stack.
+    AllowedPattern: '^[0-9]{1,20}$'
+    ConstraintDescription: Enter a numeric Telegram ID.
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Latest Amazon Linux 2023 x86_64 AMI maintained by AWS.
+Resources:
+  DimkaVpc:
+    Type: AWS::EC2::VPC
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Dedicated network keeps this bot isolated from existing account workloads.
+        must:
+          - Keep the network IPv4-only and use the declared non-overlapping CIDR.
+    Properties:
+      CidrBlock: 10.42.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-vpc
+        - Key: Project
+          Value: dimka
+        - Key: ManagedBy
+          Value: CloudFormation
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Allows the worker to reach Telegram, GitHub, AWS APIs, and SSM without inbound rules.
+        must:
+          - Attach only to DimkaVpc.
+    Properties:
+      Tags:
+        - Key: Project
+          Value: dimka
+  VpcInternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Connects the worker subnet's default route to the internet gateway.
+        must:
+          - Do not add any inbound route or security-group rule.
+    Properties:
+      VpcId: !Ref DimkaVpc
+      InternetGatewayId: !Ref InternetGateway
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Places the single worker in an outbound-routable subnet for Telegram polling and SSM.
+        must:
+          - Keep worker subnet ingress closed at the security-group layer.
+    Properties:
+      VpcId: !Ref DimkaVpc
+      CidrBlock: 10.42.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-worker-a
+        - Key: Project
+          Value: dimka
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Separate public subnet provides the second AZ required by the RDS subnet group.
+        must:
+          - Keep this subnet routed to the internet gateway only for outbound connectivity.
+    Properties:
+      VpcId: !Ref DimkaVpc
+      CidrBlock: 10.42.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-worker-b
+        - Key: Project
+          Value: dimka
+  PrivateDbSubnetA:
+    Type: AWS::EC2::Subnet
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: First isolated subnet for the Multi-AZ PostgreSQL subnet group.
+        must:
+          - Do not associate an internet route table.
+    Properties:
+      VpcId: !Ref DimkaVpc
+      CidrBlock: 10.42.11.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-db-a
+        - Key: Project
+          Value: dimka
+  PrivateDbSubnetB:
+    Type: AWS::EC2::Subnet
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Second isolated subnet enables RDS Multi-AZ placement.
+        must:
+          - Do not associate an internet route table.
+    Properties:
+      VpcId: !Ref DimkaVpc
+      CidrBlock: 10.42.12.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-db-b
+        - Key: Project
+          Value: dimka
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Holds the single outbound default route for the worker subnets.
+        must:
+          - Never add inbound access; route tables are not an ingress control.
+    Properties:
+      VpcId: !Ref DimkaVpc
+      Tags:
+        - Key: Project
+          Value: dimka
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcInternetGatewayAttachment
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Provides outbound IPv4 access needed by the worker.
+        must:
+          - Keep the destination at 0.0.0.0/0 and target the attached gateway.
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicSubnetRouteAssociationA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Routes the worker subnet through the public route table.
+        must:
+          - Do not associate any private database subnet.
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+  PublicSubnetRouteAssociationB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Completes the public subnet pair used by the worker and RDS subnet group.
+        must:
+          - Do not associate any private database subnet.
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Restricts RDS placement to two isolated AZ subnets.
+        must:
+          - Use only the private database subnets.
+    Properties:
+      DBSubnetGroupDescription: Private subnets for Dimka PostgreSQL.
+      SubnetIds:
+        - !Ref PrivateDbSubnetA
+        - !Ref PrivateDbSubnetB
+      Tags:
+        - Key: Project
+          Value: dimka
+  WorkerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: The worker needs outbound HTTPS and DNS for Telegram, GitHub, AWS APIs, and SSM.
+        must:
+          - Keep ingress empty; administer through Systems Manager.
+    Properties:
+      GroupDescription: Outbound-only security group for Dimka worker.
+      VpcId: !Ref DimkaVpc
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Project
+          Value: dimka
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Allows PostgreSQL only from the Dimka worker.
+        must:
+          - Never allow public or CIDR-based ingress to port 5432.
+    Properties:
+      GroupDescription: PostgreSQL accepts connections from the Dimka worker security group only.
+      VpcId: !Ref DimkaVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref WorkerSecurityGroup
+      Tags:
+        - Key: Project
+          Value: dimka
+  BotTokenKmsKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Dedicated customer-managed key protects the Telegram API token secret.
+        must:
+          - Keep key material and policy if the stack is removed or replaced.
+    Properties:
+      Description: !Sub KMS key for the ${AWS::StackName} Telegram token secret.
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableAccountIAMPermissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+      Tags:
+        - Key: Project
+          Value: dimka
+        - Key: ManagedBy
+          Value: CloudFormation
+  BotTokenKmsAlias:
+    Type: AWS::KMS::Alias
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Gives the bot-token key a recognizable account alias.
+        must:
+          - Point only to BotTokenKmsKey.
+    Properties:
+      AliasName: !Sub alias/${AWS::StackName}-bot-token
+      TargetKeyId: !Ref BotTokenKmsKey
+  ApplicationSecretKmsKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Dedicated customer-managed key protects the generated runtime database credential.
+        must:
+          - Keep key material and policy if the stack is removed or replaced.
+    Properties:
+      Description: !Sub KMS key for the ${AWS::StackName} runtime database secret.
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableAccountIAMPermissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+      Tags:
+        - Key: Project
+          Value: dimka
+        - Key: ManagedBy
+          Value: CloudFormation
+  ApplicationSecretKmsAlias:
+    Type: AWS::KMS::Alias
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Gives the runtime database secret key a recognizable alias.
+        must:
+          - Point only to ApplicationSecretKmsKey.
+    Properties:
+      AliasName: !Sub alias/${AWS::StackName}-runtime-db
+      TargetKeyId: !Ref ApplicationSecretKmsKey
+  DatabaseKmsKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Encrypts RDS storage, Performance Insights, and PostgreSQL log data with account-controlled key material.
+        must:
+          - Preserve key material while retained database snapshots or log groups exist.
+          - Allow CloudWatch Logs only the key use needed for this stack's PostgreSQL log group.
+    Properties:
+      Description: !Sub KMS key for ${AWS::StackName} PostgreSQL data and logs.
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableAccountIAMPermissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Sid: AllowOnlyDimkaPostgreSQLLogGroup
+            Effect: Allow
+            Principal:
+              Service: !Sub logs.${AWS::Region}.amazonaws.com
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: '*'
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/rds/instance/${AWS::StackName}-postgres/postgresql
+      Tags:
+        - Key: Project
+          Value: dimka
+        - Key: ManagedBy
+          Value: CloudFormation
+  DatabaseKmsAlias:
+    Type: AWS::KMS::Alias
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Gives the PostgreSQL data key a recognizable alias.
+        must:
+          - Point only to DatabaseKmsKey.
+    Properties:
+      AliasName: !Sub alias/${AWS::StackName}-postgres
+      TargetKeyId: !Ref DatabaseKmsKey
+  BotTokenSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Holds the BotFather token separately from source and deployment configuration.
+        must:
+          - Replace the placeholder value with the actual token before starting the bot.
+          - Rotate the token manually through BotFather and update this secret; BotFather has no automatic rotation API.
+    Properties:
+      Description: Telegram BotFather token for Dimka production.
+      KmsKeyId: !GetAtt BotTokenKmsKey.Arn
+      SecretString: REPLACE_WITH_BOTFATHER_TOKEN
+      Tags:
+        - Key: Project
+          Value: dimka
+        - Key: ManagedBy
+          Value: CloudFormation
+  ApplicationDatabaseSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Generates a dedicated, restricted PostgreSQL login used by the bot runtime.
+        must:
+          - Keep this credential out of Git, UserData, CloudFormation outputs, and logs.
+          - Coordinate any manual password rotation with the database role before updating this value.
+    Properties:
+      Description: Runtime PostgreSQL login for Dimka production.
+      KmsKeyId: !GetAtt ApplicationSecretKmsKey.Arn
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"dimka_runtime"}'
+        GenerateStringKey: password
+        PasswordLength: 40
+        ExcludePunctuation: true
+      Tags:
+        - Key: Project
+          Value: dimka
+        - Key: ManagedBy
+          Value: CloudFormation
+  DatabaseParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Enforces TLS connections and records connection lifecycle events for PostgreSQL.
+        must:
+          - Keep rds.force_ssl enabled.
+    Properties:
+      Description: !Sub TLS and connection logging for ${AWS::StackName}.
+      Family: postgres18
+      Parameters:
+        rds.force_ssl: '1'
+        log_connections: '1'
+        log_disconnections: '1'
+      Tags:
+        - Key: Project
+          Value: dimka
+  DatabaseLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Stores exported PostgreSQL connection and engine logs encrypted by DatabaseKmsKey.
+        must:
+          - Keep log-group encryption and 30-day retention.
+    Properties:
+      LogGroupName: !Sub /aws/rds/instance/${AWS::StackName}-postgres/postgresql
+      KmsKeyId: !GetAtt DatabaseKmsKey.Arn
+      RetentionInDays: 30
+      Tags:
+        - Key: Project
+          Value: dimka
+  PostgreSQL:
+    Type: AWS::RDS::DBInstance
+    DependsOn:
+      - DatabaseLogGroup
+      - DatabaseKmsAlias
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Durable PostgreSQL storage for inbox history, owner settings, and tracker tasks; Multi-AZ protects against an AZ failure.
+        must:
+          - Keep MultiAZ, storage encryption, TLS enforcement, deletion protection, seven-day backups, and private network placement.
+          - Retain data and snapshots on stack deletion or replacement.
+          - Use the PostgreSQL 18 parameter family and the validated 18.6 engine version.
+    Properties:
+      DBInstanceIdentifier: !Sub ${AWS::StackName}-postgres
+      Engine: postgres
+      EngineVersion: '18.6'
+      DBInstanceClass: db.t4g.micro
+      DBName: telegram_bot
+      MasterUsername: dimka_master
+      ManageMasterUserPassword: true
+      DBParameterGroupName: !Ref DatabaseParameterGroup
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      VPCSecurityGroups:
+        - !GetAtt DatabaseSecurityGroup.GroupId
+      PubliclyAccessible: false
+      MultiAZ: true
+      StorageType: gp3
+      AllocatedStorage: '20'
+      StorageEncrypted: true
+      KmsKeyId: !GetAtt DatabaseKmsKey.Arn
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: 17:00-18:00
+      PreferredMaintenanceWindow: sun:20:00-sun:20:30
+      CopyTagsToSnapshot: true
+      AutoMinorVersionUpgrade: true
+      DeletionProtection: true
+      EnablePerformanceInsights: true
+      PerformanceInsightsKMSKeyId: !GetAtt DatabaseKmsKey.Arn
+      PerformanceInsightsRetentionPeriod: 7
+      EnableCloudwatchLogsExports:
+        - postgresql
+      Tags:
+        - Key: Project
+          Value: dimka
+        - Key: Environment
+          Value: production
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: created_by
+          Value: rds-oss-skill
+        - Key: generation_model
+          Value: GPT-6
+  WorkerRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Gives the worker temporary SSM and scoped Secrets Manager access through its instance profile.
+        must:
+          - Limit secret reads to the three secrets used by this bot.
+          - Limit KMS decrypt to the two customer-managed secret keys through Secrets Manager.
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-worker
+      Description: Dimka EC2 runtime role for Systems Manager and three scoped secrets.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: DimkaRuntimeSecrets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadDimkaSecrets
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref BotTokenSecret
+                  - !Ref ApplicationDatabaseSecret
+                  - !GetAtt PostgreSQL.MasterUserSecret.SecretArn
+              - Sid: DecryptDimkaSecretKeysViaSecretsManager
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource:
+                  - !GetAtt BotTokenKmsKey.Arn
+                  - !GetAtt ApplicationSecretKmsKey.Arn
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub secretsmanager.${AWS::Region}.amazonaws.com
+      Tags:
+        - Key: Project
+          Value: dimka
+  WorkerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Attaches WorkerRole to the EC2 instance so it uses short-lived credentials.
+        must:
+          - Never place access keys in instance configuration.
+    Properties:
+      InstanceProfileName: !Sub ${AWS::StackName}-worker
+      Roles:
+        - !Ref WorkerRole
+  Worker:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - PublicSubnetRouteAssociationA
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Runs one Node.js long-polling worker and accepts no inbound network connections.
+        must:
+          - Require IMDSv2 and use encrypted gp3 root storage.
+          - Run a single bot process for this token.
+          - Use SSM Run Command rather than SSH for deployments and administration.
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: t3.small
+      IamInstanceProfile: !Ref WorkerInstanceProfile
+      SubnetId: !Ref PublicSubnetA
+      SecurityGroupIds:
+        - !Ref WorkerSecurityGroup
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+        HttpPutResponseHopLimit: 1
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: 16
+            Encrypted: true
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          dnf install -y git nodejs22 awscli-2 curl tar gzip jq postgresql15
+          id dimka >/dev/null 2>&1 || useradd --system --home-dir /opt/dimka --create-home --shell /sbin/nologin dimka
+          chown root:root /opt/dimka
+          chmod 0755 /opt/dimka
+          mkdir -p /opt/dimka/releases /var/lib/dimka /etc/dimka-bot
+          chown root:dimka /opt/dimka/releases
+          chmod 0750 /opt/dimka/releases
+          chmod 0750 /etc/dimka-bot
+          curl --fail --silent --show-error --location https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem --output /etc/pki/tls/certs/rds-global-bundle.pem
+          chmod 0644 /etc/pki/tls/certs/rds-global-bundle.pem
+          cat > /etc/dimka-bot/environment <<'ENV'
+          AWS_REGION=${AWS::Region}
+          BOT_TOKEN_SECRET_ARN=${BotTokenSecret}
+          APP_DATABASE_SECRET_ARN=${ApplicationDatabaseSecret}
+          DB_MASTER_SECRET_ARN=${PostgreSQL.MasterUserSecret.SecretArn}
+          DB_HOST=${PostgreSQL.Endpoint.Address}
+          DB_PORT=${PostgreSQL.Endpoint.Port}
+          DB_NAME=telegram_bot
+          OWNER_TELEGRAM_ID=${OwnerTelegramId}
+          TIMEZONE=Asia/Almaty
+          RDS_CA_FILE=/etc/pki/tls/certs/rds-global-bundle.pem
+          ENV
+          chmod 0600 /etc/dimka-bot/environment
+          cat > /usr/local/sbin/dimka-deploy <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          REVISION="$1"
+          if [[ ! "$REVISION" =~ ^[0-9a-f]{40}$ ]]; then
+            echo 'Expected a full 40-character Git commit SHA.' >&2
+            exit 2
+          fi
+          REPO=/var/lib/dimka/repo.git
+          if [[ ! -d "$REPO" ]]; then
+            git clone --bare https://github.com/yessenyessenov622-afk/dimka.git "$REPO"
+          fi
+          git --git-dir="$REPO" fetch --quiet --force origin main
+          git --git-dir="$REPO" cat-file -e "$REVISION^{commit}"
+          RELEASE="/opt/dimka/releases/$REVISION"
+          CURRENT="$(readlink -f /opt/dimka/current 2>/dev/null || true)"
+          if [[ "$CURRENT" == "$RELEASE" ]]; then
+            exit 0
+          fi
+          rm -rf -- "$RELEASE"
+          mkdir -p "$RELEASE"
+          git --git-dir="$REPO" archive "$REVISION" | tar -x -C "$RELEASE"
+          bash "$RELEASE/infra/scripts/deploy-release.sh" "$RELEASE" "$REVISION"
+          SCRIPT
+          chmod 0750 /usr/local/sbin/dimka-deploy
+          cat > /etc/systemd/system/dimka-bot.service <<'UNIT'
+          [Unit]
+          Description=Dimka Telegram bot
+          Wants=network-online.target
+          After=network-online.target
+
+          [Service]
+          Type=simple
+          User=dimka
+          Group=dimka
+          WorkingDirectory=/opt/dimka/current
+          EnvironmentFile=/etc/dimka-bot/environment
+          ExecStart=/usr/local/sbin/dimka-with-secrets npm start
+          Restart=always
+          RestartSec=15
+          NoNewPrivileges=true
+          ProtectSystem=strict
+          ProtectHome=true
+          PrivateTmp=true
+
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+          chmod 0644 /etc/systemd/system/dimka-bot.service
+          git clone --bare https://github.com/yessenyessenov622-afk/dimka.git /var/lib/dimka/repo.git
+          systemctl daemon-reload
+          systemctl enable dimka-bot.service
+          systemctl enable --now amazon-ssm-agent
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-worker
+        - Key: Project
+          Value: dimka
+        - Key: Environment
+          Value: production
+        - Key: DimkaDeployTarget
+          Value: dimka-prod
+        - Key: ManagedBy
+          Value: CloudFormation
+  GitHubDeployRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Lets only the Dimka main branch request an SSM deployment without stored AWS keys.
+        must:
+          - Trust only the exact repository main-branch subject and sts.amazonaws.com audience.
+          - Limit Run Command to the Dimka worker and AWS-RunShellScript.
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-github-deploy
+      Description: GitHub Actions OIDC role limited to deploying the Dimka main branch.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub:
+                  - repo:yessenyessenov622-afk/dimka:ref:refs/heads/main
+                  - repo:yessenyessenov622-afk@344660770/dimka@1442731442:ref:refs/heads/main
+      Policies:
+        - PolicyName: DimkaSsmDeploy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: SendCommandOnlyToDimkaWorker
+                Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/DimkaDeployTarget: dimka-prod
+              - Sid: SendOnlyApprovedRunShellScript
+                Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}::document/AWS-RunShellScript
+              - Sid: ReadCommandResult
+                Effect: Allow
+                Action:
+                  - ssm:GetCommandInvocation
+                  - ssm:ListCommandInvocations
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: dimka
+Outputs:
+  WorkerInstanceId:
+    Description: EC2 worker managed by Systems Manager; no SSH port is open.
+    Value: !Ref Worker
+  DatabaseEndpoint:
+    Description: Private PostgreSQL endpoint reachable only from the worker security group.
+    Value: !GetAtt PostgreSQL.Endpoint.Address
+  GitHubDeployRoleArn:
+    Description: OIDC role assumed by the GitHub Actions deployment workflow.
+    Value: !GetAtt GitHubDeployRole.Arn
+  BotTokenSecretArn:
+    Description: Secrets Manager ARN; replace its placeholder value with the BotFather token before starting the worker.
+    Value: !Ref BotTokenSecret
+  ApplicationDatabaseSecretArn:
+    Description: Secrets Manager ARN for the restricted runtime PostgreSQL login.
+    Value: !Ref ApplicationDatabaseSecret
