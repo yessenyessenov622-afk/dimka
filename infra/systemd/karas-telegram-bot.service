@@ -1,0 +1,31 @@
+[Unit]
+Description=Karas Telegram anonymous inbox and task tracker
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=karasbot
+Group=karasbot
+WorkingDirectory=/opt/karas-telegram-bot/current
+EnvironmentFile=/etc/karas-telegram-bot/environment
+EnvironmentFile=/etc/karas-telegram-bot/secrets
+ExecStart=/usr/bin/node dist/index.js
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/karas-telegram-bot
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

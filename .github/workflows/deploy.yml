@@ -1,10 +1,10 @@
-name: Deploy Dimka to AWS
+name: Deploy Karas Telegram bot
 
 on:
   workflow_dispatch:
     inputs:
       revision:
-        description: Full commit SHA to deploy (defaults to the workflow commit)
+        description: Full commit SHA to deploy (defaults to this workflow commit)
         required: false
         type: string
 
@@ -13,13 +13,13 @@ permissions:
   id-token: write
 
 concurrency:
-  group: dimka-production-deploy
+  group: karas-telegram-bot-production
   cancel-in-progress: false
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     env:
       AWS_REGION: eu-north-1
       DEPLOY_REVISION: ${{ inputs.revision || github.sha }}
@@ -27,9 +27,9 @@ jobs:
       - name: Configure AWS credentials with GitHub OIDC
         uses: aws-actions/configure-aws-credentials@v6.3.0
         with:
-          role-to-assume: arn:aws:iam::478726716640:role/dimka-prod-github-deploy
+          role-to-assume: arn:aws:iam::478726716640:role/karas-telegram-bot-github-deploy
           aws-region: eu-north-1
-          role-session-name: dimka-${{ github.run_id }}
+          role-session-name: karas-${{ github.run_id }}
 
       - name: Deploy the selected commit through SSM
         shell: bash
@@ -41,44 +41,53 @@ jobs:
           fi
 
           command_id="$(aws ssm send-command \
-            --targets Key=tag:DimkaDeployTarget,Values=dimka-prod \
+            --targets "Key=tag:KarasBotDeployTarget,Values=true" \
             --document-name AWS-RunShellScript \
             --comment "Deploy $DEPLOY_REVISION" \
-            --timeout-seconds 600 \
+            --timeout-seconds 1800 \
             --max-concurrency 1 \
             --max-errors 0 \
-            --parameters "commands=sudo /usr/local/sbin/dimka-deploy $DEPLOY_REVISION" \
+            --parameters "commands=sudo /usr/local/sbin/karas-telegram-bot-deploy $DEPLOY_REVISION" \
             --query 'Command.CommandId' \
             --output text)"
 
           instance_id=""
-          for attempt in {1..20}; do
+          for attempt in {1..30}; do
             instance_id="$(aws ssm list-command-invocations \
               --command-id "$command_id" \
+              --details \
               --query 'CommandInvocations[0].InstanceId' \
               --output text 2>/dev/null || true)"
             if [[ -n "$instance_id" && "$instance_id" != "None" ]]; then
               break
             fi
-            sleep 3
+            sleep 2
           done
           if [[ -z "$instance_id" || "$instance_id" == "None" ]]; then
             echo "SSM did not report a target instance for command $command_id." >&2
             exit 1
           fi
 
-          aws ssm wait command-executed --command-id "$command_id" --instance-id "$instance_id"
-          status="$(aws ssm get-command-invocation \
-            --command-id "$command_id" \
-            --instance-id "$instance_id" \
-            --query Status \
-            --output text)"
-          if [[ "$status" != "Success" ]]; then
-            aws ssm get-command-invocation \
+          for attempt in {1..180}; do
+            status="$(aws ssm get-command-invocation \
               --command-id "$command_id" \
               --instance-id "$instance_id" \
-              --query StandardErrorContent \
-              --output text
-            echo "Deployment finished with SSM status: $status" >&2
-            exit 1
-          fi
+              --query Status \
+              --output text 2>/dev/null || true)"
+            case "$status" in
+              Success) exit 0 ;;
+              Failed|TimedOut|Cancelled|Cancelling)
+                aws ssm get-command-invocation \
+                  --command-id "$command_id" \
+                  --instance-id "$instance_id" \
+                  --query StandardErrorContent \
+                  --output text
+                echo "Deployment finished with SSM status: $status" >&2
+                exit 1
+                ;;
+            esac
+            sleep 5
+          done
+
+          echo "Timed out waiting for SSM deployment command $command_id." >&2
+          exit 1

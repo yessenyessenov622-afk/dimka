@@ -1,68 +1,62 @@
-# Dimka AWS deployment
+# Existing EC2 deployment
 
-This stack creates a dedicated VPC, one outbound-only EC2 worker, and private
-Multi-AZ PostgreSQL in eu-north-1. The EC2 host has no SSH or other inbound
-security-group rules. GitHub Actions assumes a short-lived AWS role through
-OIDC and runs the deployment script through Systems Manager. No AWS access key
-or Telegram token belongs in GitHub.
+Production uses the existing EC2 instance selected by the owner. The bot and
+its data live in separate directories under /opt/karas-telegram-bot and
+/var/lib/karas-telegram-bot. This setup does not alter other applications.
+The bot uses Telegram long polling and does not open an inbound application
+port. systemd starts it at boot and restarts it if the process exits.
 
-The stack defaults are EC2 t3.small with a 16 GB encrypted gp3 root disk, and
-PostgreSQL 18.6 on db.t4g.micro with 20 GB encrypted gp3 storage, Multi-AZ,
-seven-day backups, Performance Insights, deletion protection, TLS enforcement,
-and 30-day encrypted database logs. RDS is not publicly accessible and allows
-connections only from the EC2 security group. The bot's database login is
-separate from the RDS master account.
+The deployment creates no EC2 instance, database service, NAT gateway, load
+balancer, Elastic IP, CloudWatch log group, or other application infrastructure.
+It uses the existing instance profile and Systems Manager Run Command. Run
+Command is offered at no additional cost for EC2 managed nodes.
 
-Before the bot can start, replace the placeholder value in the
-BotTokenSecretArn output with the BotFather token using Secrets Manager. The
-secret is encrypted with its own customer-managed KMS key. The token is not
-included in this repository or in the stack template. Rotate it manually in
-BotFather, then update the same secret; BotFather does not provide an automatic
-rotation API.
+## Credentials
 
-The deployed workflow is staged as workflow_dispatch until the AWS stack and
-OIDC role exist. After the stack is created and the initial token is set, change
-the workflow trigger to push on main; that activation commit then performs the
-first deploy. Each later main commit deploys that exact commit SHA. The
-workflow serializes deployments and reports the SSM command result.
+The bot token is stored as a standard SecureString parameter and the owner ID
+as a standard String parameter. Standard Parameter Store parameters do not add
+a monthly parameter charge. The EC2 role can read only the two parameters used
+by this application.
 
-## Estimated monthly AWS usage
+Initial provisioning copies the values once to a root-owned file with 0600
+permissions under /etc/karas-telegram-bot. systemd reads that file when it
+starts the bot, so service restarts do not call Parameter Store or KMS. The
+AWS-managed SSM KMS key has no monthly key charge; its encrypt/decrypt API
+requests are metered. Do not commit .env.
 
-At 730 hours per month, current eu-north-1 list prices are approximately:
+## Deployment
 
-- t3.small Linux EC2: USD 15.77
-- db.t4g.micro PostgreSQL Multi-AZ: USD 24.09
-- 20 GB RDS gp3 Multi-AZ storage: USD 4.80
-- 16 GB EC2 gp3 root volume: about USD 1.34
-- One public IPv4 address: about USD 3.65
-- Three customer-managed KMS keys: about USD 3.00
-- Three Secrets Manager secrets (including the RDS-managed master secret): about USD 1.20
+GitHub Actions authenticates through the repository's OIDC trust role and
+sends a command through Systems Manager to the EC2 instance carrying the
+KarasBotDeployTarget tag. IAM further restricts that role to the selected
+instance. The server accepts only commits that belong to main.
 
-Estimated baseline total: about USD 54 per month before tax, internet data
-transfer, CloudWatch log ingestion, and backup storage above the included
-allowance. AWS prices and usage vary. Deletion protection and Retain policies
-preserve database data and keys if the stack is removed, so those resources
-continue to incur charges until deliberately deleted.
+The initial workflow is manual. After the first release is deployed and
+verified, pushes to main will be enabled for automatic deployment.
 
-## Deployment scripts
+To inspect the service through SSM:
 
-The CloudFormation template is
-cloudformation/dimka-production.yaml. It requires the numeric Telegram owner ID
-as a stack parameter; the public template does not contain that ID. The runtime
-secret helper fetches credentials only when the bot or migrations start. Use
-stack name dimka-prod because the staged GitHub Actions workflow targets the
-role with that name.
+    systemctl status karas-telegram-bot.service
+    journalctl -u karas-telegram-bot.service --since today
 
-The initial AWS rollout must create the stack, set the bot token secret, wait
-for the worker to register in Systems Manager, then run the deployment for the
-main commit. Use the stack outputs for the worker ID, database endpoint,
-deployment role, and secret ARNs. Do not put secret values into shell history,
-GitHub, UserData, command-line arguments, or CloudFormation parameters.
+To see local storage usage:
 
-RDS master credentials are managed and rotated by RDS. The bot uses a separate
-restricted database role whose password is stored in Secrets Manager; its
-rotation requires updating both the database role and the secret together.
+    du -sh /var/lib/karas-telegram-bot
 
-The AWS account currently has no CloudTrail trail. CloudFormation's events and
-AWS's event history remain available, but centralized API audit logging is not
-configured by this project.
+## Free Plan
+
+EC2, its existing disk, its existing public IPv4 address, and outbound data
+transfer can consume Free Plan credits. Free Tier eligibility depends on the
+account's remaining shared limits and is not guaranteed by the EC2 instance
+type alone. Other account resources use the same credit balance.
+
+T3 instances use Standard CPU credit mode. This avoids charges for surplus
+CPU credits; if credits run out, CPU performance is limited to the instance
+baseline.
+
+When a Free Plan credit balance is exhausted or the plan expires, AWS closes
+the Free-plan account instead of automatically converting it to a paid plan.
+Resources and data become inaccessible; AWS retains data for 90 days. The
+bot therefore cannot be promised to run continuously after shared credits are
+depleted. Do not upgrade the account to a paid plan without the owner's
+decision.

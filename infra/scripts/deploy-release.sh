@@ -1,71 +1,65 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-RELEASE_DIR="$1"
-REVISION="$2"
-cd "$RELEASE_DIR"
+REVISION="$1"
+APP_ROOT="/opt/karas-telegram-bot"
+RELEASES="$APP_ROOT/releases"
+RELEASE_DIR="$RELEASES/$REVISION"
+CURRENT="$APP_ROOT/current"
 
-# Load only non-secret identifiers. Credentials are fetched from Secrets Manager below.
+if [[ ! "$REVISION" =~ ^[0-9a-f]{40}$ || ! -d "$RELEASE_DIR" ]]; then
+  echo "Invalid or missing release directory." >&2
+  exit 2
+fi
+
+cd "$RELEASE_DIR"
 set -a
-. /etc/dimka-bot/environment
+. /etc/karas-telegram-bot/environment
 set +a
 
-npm ci --include=dev
+npm ci --include=dev --no-audit --no-fund
 npm run build
+npm run db:migrate
+npm prune --omit=dev --no-audit --no-fund
 
-MASTER_SECRET_JSON="$(aws secretsmanager get-secret-value \
-  --secret-id "$DB_MASTER_SECRET_ARN" \
-  --query SecretString \
-  --output text \
-  --region "$AWS_REGION")"
-APP_SECRET_JSON="$(aws secretsmanager get-secret-value \
-  --secret-id "$APP_DATABASE_SECRET_ARN" \
-  --query SecretString \
-  --output text \
-  --region "$AWS_REGION")"
-MASTER_USERNAME="$(jq -r '.username' <<<"$MASTER_SECRET_JSON")"
-MASTER_PASSWORD="$(jq -r '.password' <<<"$MASTER_SECRET_JSON")"
-APP_USERNAME="$(jq -r '.username' <<<"$APP_SECRET_JSON")"
-APP_PASSWORD="$(jq -r '.password' <<<"$APP_SECRET_JSON")"
+if [[ ! -s /etc/karas-telegram-bot/secrets ]]; then
+  /usr/local/sbin/karas-telegram-bot-provision-secrets
+fi
 
-# The generated app password is alphanumeric, so it is safe in this unlogged SQL input.
-export PGPASSWORD="$MASTER_PASSWORD"
-export PGSSLMODE=verify-full
-export PGSSLROOTCERT="$RDS_CA_FILE"
-psql --no-password \
-  --host "$DB_HOST" \
-  --port "$DB_PORT" \
-  --username "$MASTER_USERNAME" \
-  --dbname "$DB_NAME" \
-  --set=ON_ERROR_STOP=1 <<SQL
-DO \$role\$
-BEGIN
-  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '$APP_USERNAME') THEN
-    ALTER ROLE $APP_USERNAME WITH LOGIN PASSWORD '$APP_PASSWORD';
-  ELSE
-    CREATE ROLE $APP_USERNAME LOGIN PASSWORD '$APP_PASSWORD';
-  END IF;
-END
-\$role\$;
-GRANT CONNECT ON DATABASE $DB_NAME TO $APP_USERNAME;
-GRANT CREATE ON DATABASE $DB_NAME TO $APP_USERNAME;
-GRANT USAGE, CREATE ON SCHEMA public TO $APP_USERNAME;
-ALTER SCHEMA public OWNER TO $APP_USERNAME;
-SQL
-unset PGPASSWORD MASTER_SECRET_JSON APP_SECRET_JSON MASTER_USERNAME MASTER_PASSWORD APP_USERNAME APP_PASSWORD
-
-install -o root -g root -m 0755 infra/scripts/with-secrets.sh /usr/local/sbin/dimka-with-secrets.new
-mv -f /usr/local/sbin/dimka-with-secrets.new /usr/local/sbin/dimka-with-secrets
-chown -R root:dimka "$RELEASE_DIR"
+chown -R root:karasbot "$RELEASE_DIR"
 chmod -R g+rX,o-rwx "$RELEASE_DIR"
-rm -f /opt/dimka/current.next
-ln -s "$RELEASE_DIR" /opt/dimka/current.next
-mv -Tf /opt/dimka/current.next /opt/dimka/current
-systemctl restart dimka-bot.service
 
-# Keep the active release and the five newest previous releases for rollback.
-mapfile -t OLD_RELEASES < <(ls -1dt /opt/dimka/releases/* 2>/dev/null | tail -n +7)
+PREVIOUS_RELEASE=""
+if [[ -L "$CURRENT" ]]; then
+  PREVIOUS_RELEASE="$(readlink -f "$CURRENT" || true)"
+fi
+ln -s "$RELEASE_DIR" "$APP_ROOT/current.next"
+mv -Tf "$APP_ROOT/current.next" "$CURRENT"
+
+if ! systemctl restart karas-telegram-bot.service; then
+  if [[ -n "$PREVIOUS_RELEASE" && -d "$PREVIOUS_RELEASE" ]]; then
+    ln -s "$PREVIOUS_RELEASE" "$APP_ROOT/current.rollback"
+    mv -Tf "$APP_ROOT/current.rollback" "$CURRENT"
+    systemctl restart karas-telegram-bot.service || true
+  fi
+  echo "The bot service did not start for release $REVISION." >&2
+  exit 1
+fi
+
+for attempt in {1..15}; do
+  if systemctl is-active --quiet karas-telegram-bot.service; then
+    break
+  fi
+  sleep 2
+done
+if ! systemctl is-active --quiet karas-telegram-bot.service; then
+  echo "The bot service is not active after deployment." >&2
+  exit 1
+fi
+
+mapfile -t OLD_RELEASES < <(find "$RELEASES" -mindepth 1 -maxdepth 1 -type d ! -path "$RELEASE_DIR" -printf '%T@ %p\n' | sort -rn | tail -n +2 | cut -d' ' -f2-)
 if (( ${#OLD_RELEASES[@]} > 0 )); then
   rm -rf -- "${OLD_RELEASES[@]}"
 fi
-echo "Deployed $REVISION."
+
+echo "Deployed commit $REVISION; service is active."

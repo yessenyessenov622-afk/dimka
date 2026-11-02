@@ -5,3 +5,7 @@ dist/
 !.env.example
 *.log
 coverage/
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3

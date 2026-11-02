@@ -2,7 +2,7 @@
   "name": "anonymous-inbox-task-bot",
   "version": "1.0.0",
   "private": true,
-  "description": "Telegram inbox and task tracker powered by Telegraf, PostgreSQL and Prisma",
+  "description": "Telegram inbox and task tracker powered by Telegraf, SQLite and Prisma",
   "main": "dist/index.js",
   "scripts": {
     "dev": "tsx watch src/index.ts",
