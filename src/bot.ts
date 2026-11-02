@@ -318,9 +318,9 @@ async function showSearchResults(ctx: Ctx, query: string) {
   const users = await prisma.user.findMany({
     where: {
       OR: [
-        { username: { contains: normalized, mode: 'insensitive' } },
-        { firstName: { contains: normalized, mode: 'insensitive' } },
-        { lastName: { contains: normalized, mode: 'insensitive' } },
+        { username: { contains: normalized } },
+        { firstName: { contains: normalized } },
+        { lastName: { contains: normalized } },
         ...(numericId ? [{ telegramId: numericId }] : []),
       ],
     }, include: { dialogs: true }, orderBy: { updatedAt: 'desc' }, take: 15,
